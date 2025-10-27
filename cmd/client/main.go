@@ -27,6 +27,8 @@ func main() {
 	flag.BoolVar(&useQuic, "quic", true, "Use QUIC to reach the proxy.")
 	var useDatagrams bool
 	flag.BoolVar(&useDatagrams, "datagrams", true, "Use QUIC datagrams to reach the proxy.")
+	var protocol string
+	flag.StringVar(&protocol, "protocol", "udp", "Protocol to use to reach the destination (tcp or udp).")
 	var insecureTLS bool
 	flag.BoolVar(&insecureTLS, "insecure-tls", false, "Ignore TLS certificate errors from the proxy.")
 	flag.Parse()
@@ -71,8 +73,10 @@ func main() {
 		log.Fatalf("failed to parse url: %v", err)
 	}
 
-	hcl := &http.Client{
-		Transport: &http3.Transport{
+	hcl := &http.Client{}
+	switch protocol {
+	case "udp":
+		hcl.Transport = &http3.Transport{
 			Dial: func(ctx context.Context, addr string, tlsConf *tls.Config, quicConf *quic.Config) (*quic.Conn, error) {
 				raddr, err := net.ResolveUDPAddr("udp", host+":"+strconv.Itoa(int(port)))
 				if err != nil {
@@ -87,7 +91,20 @@ func main() {
 				quicConf.DisablePathMTUDiscovery = true
 				return quic.DialEarly(ctx, pconn, raddr, tlsConf, quicConf)
 			},
-		},
+		}
+	case "tcp":
+		hcl.Transport = &http.Transport{
+			DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				raddr, err := net.ResolveTCPAddr("tcp", host+":"+strconv.Itoa(int(port)))
+				if err != nil {
+					return nil, err
+				}
+				conn, _, err := cl.DialTCP(ctx, parsedTemplate, raddr)
+				return conn, err
+			},
+		}
+	default:
+		log.Fatalf("unknown protocol: %s", protocol)
 	}
 	rsp, err := hcl.Get(urls[0])
 	if err != nil {

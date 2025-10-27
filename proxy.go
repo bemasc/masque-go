@@ -3,6 +3,7 @@ package masque
 import (
 	"bufio"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
@@ -23,20 +24,36 @@ const (
 	uriTemplateTargetPort = "target_port"
 )
 
+// Limits the size of downstream TCP capsules
+const maxTCPChunkSize = 32 * 1024 // 32KB, somewhat arbitrary
+
+// From https://www.ietf.org/archive/id/draft-ietf-httpbis-connect-tcp-09.html#section-8.3-3
+// TODO: Update to final values once they are registered.
+const (
+	data08CapsuleType      = 0x2028d7f0
+	finalData08CapsuleType = 0x2028d7f1
+)
+
 const datagramCapsuleType = 0x00
 
 const maxUDPPayloadSize = 1500
 
+const H3_CONNECT_ERROR = 0x010f // RFC 9114: https://datatracker.ietf.org/doc/html/rfc9114#H3_CONNECT_ERROR
+
 var contextIDZero = quicvarint.Append([]byte{}, 0)
 
 type proxyEntry struct {
-	str  *http3.Stream
-	conn *net.UDPConn
+	rsp http.ResponseWriter
+	req io.ReadCloser
 }
 
 func (e proxyEntry) Close() error {
-	e.str.CancelRead(quic.StreamErrorCode(http3.ErrCodeConnectError))
-	return errors.Join(e.str.Close(), e.conn.Close())
+	if streamer, isH3 := e.rsp.(http3.HTTPStreamer); isH3 {
+		str := streamer.HTTPStream()
+		str.CancelRead(quic.StreamErrorCode(http3.ErrCodeConnectError))
+	}
+
+	return e.req.Close()
 }
 
 func isCleanShutdownError(err error) bool {
@@ -145,32 +162,65 @@ func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
 		return err
 	}
 
-	addr, err := net.ResolveUDPAddr("udp", r.Target)
-	if err != nil {
-		var dnsError *net.DNSError
-		if errors.As(err, &dnsError) {
-			dnsErrorToProxyStatus(&proxyStatus, dnsError)
+	switch r.Protocol {
+	case ConnectUDP:
+		addr, err := net.ResolveUDPAddr("udp", r.Target)
+		if err != nil {
+			var dnsError *net.DNSError
+			if errors.As(err, &dnsError) {
+				dnsErrorToProxyStatus(&proxyStatus, dnsError)
+			}
+			err = writeProxyStatus(err)
+			w.WriteHeader(errToStatus(err))
+			return err
 		}
-		err = writeProxyStatus(err)
-		w.WriteHeader(errToStatus(err))
-		return err
-	}
-	proxyStatus.Params.Add("next-hop", addr.String())
+		proxyStatus.Params.Add("next-hop", addr.String())
 
-	conn, err := net.DialUDP("udp", nil, addr)
-	if err != nil {
-		proxyStatus.Params.Add("error", "destination_ip_unroutable")
-		err = writeProxyStatus(err)
-		w.WriteHeader(errToStatus(err))
-		return err
-	}
-	defer conn.Close()
+		conn, err := net.DialUDP("udp", nil, addr)
+		if err != nil {
+			proxyStatus.Params.Add("error", "destination_ip_unroutable")
+			err = writeProxyStatus(err)
+			w.WriteHeader(errToStatus(err))
+			return err
+		}
+		defer conn.Close()
 
-	if err = writeProxyStatus(nil); err != nil {
-		w.WriteHeader(errToStatus(err))
-		return err
+		if err = writeProxyStatus(nil); err != nil {
+			w.WriteHeader(errToStatus(err))
+			return err
+		}
+		return s.ProxyConnectedSocket(w, r, conn)
+	case ConnectTCP:
+		conn, err := net.Dial("tcp", r.Target)
+		if err != nil {
+			var dnsError *net.DNSError
+			if errors.As(err, &dnsError) {
+				dnsErrorToProxyStatus(&proxyStatus, dnsError)
+			} else {
+				var netErr net.Error
+				if errors.As(err, &netErr) && netErr.Timeout() {
+					proxyStatus.Params.Add("error", "connection_timeout")
+				} else {
+					proxyStatus.Params.Add("error", "connection_refused")
+				}
+			}
+			err = writeProxyStatus(err)
+
+			w.WriteHeader(errToStatus(err))
+			return err
+		}
+
+		defer conn.Close()
+
+		proxyStatus.Params.Add("next-hop", conn.RemoteAddr().String())
+		if err := writeProxyStatus(nil); err != nil {
+			w.WriteHeader(errToStatus(err))
+			return err
+		}
+
+		return s.ProxyTCPSocket(w, r, conn.(*net.TCPConn), proxyStatus)
 	}
-	return s.ProxyConnectedSocket(w, r, conn)
+	return fmt.Errorf("unknown protocol %q", r.Protocol)
 }
 
 func hijackIfH1(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
@@ -257,7 +307,7 @@ func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, r *Request, conn *ne
 		s.closers[closer] = struct{}{}
 		s.mx.Unlock()
 
-		if err := writeResponseWithHijacker(w.Header(), h1Conn, buf, requestProtocol); err != nil {
+		if err := writeResponseWithHijacker(w.Header(), h1Conn, buf, ConnectUDP); err != nil {
 			return err
 		}
 
@@ -267,7 +317,7 @@ func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, r *Request, conn *ne
 
 		str := w.(http3.HTTPStreamer).HTTPStream()
 
-		closer = proxyEntry{str: str, conn: conn}
+		closer = proxyEntry{rsp: w, req: str}
 		s.closers[closer] = struct{}{}
 		s.mx.Unlock()
 
@@ -316,6 +366,74 @@ func clientAcceptsDatagrams(w http.ResponseWriter) bool {
 	<-h3Connection.ReceivedSettings()
 	remoteSettings := h3Connection.Settings()
 	return remoteSettings.EnableDatagrams
+}
+
+type flusher interface{ FlushError() error }
+
+// ProxyTCPSocket proxies a request on a connected TCP socket.
+// Applications may add custom header fields to the response header,
+// but MUST NOT call WriteHeader on the http.ResponseWriter.
+// It closes the connection before returning.
+func (s *Proxy) ProxyTCPSocket(w http.ResponseWriter, r *Request, conn *net.TCPConn, proxyStatus httpsfv.Item) error {
+	s.mx.Lock()
+	if s.closed {
+		s.mx.Unlock()
+		conn.Close()
+		w.WriteHeader(http.StatusServiceUnavailable)
+		return net.ErrClosed
+	}
+
+	if s.closers == nil {
+		s.closers = make(map[io.Closer]struct{})
+	}
+	closer := r.Body
+	s.closers[closer] = struct{}{}
+
+	s.refCount.Add(1)
+	defer s.refCount.Done()
+	s.mx.Unlock()
+
+	w.Header().Set(http3.CapsuleProtocolHeader, capsuleProtocolHeaderValue)
+	h1Conn, buf, err := hijackIfH1(w)
+	if err != nil {
+		return err
+	}
+
+	if h1Conn != nil {
+		closer = h1Conn
+		defer h1Conn.Close()
+		// The request body is no longer relevant due to hijack.  Use the
+		// hijacked connection instead.
+		s.mx.Lock()
+		delete(s.closers, r.Body)
+		s.closers[h1Conn] = struct{}{}
+		s.mx.Unlock()
+
+		if err := writeResponseWithHijacker(w.Header(), h1Conn, buf, ConnectTCP); err != nil {
+			return err
+		}
+
+		forwardTCP(h1Conn, h1Conn, conn)
+	} else {
+		w.WriteHeader(http.StatusOK)
+		if f, isFlusher := w.(flusher); isFlusher {
+			// Force quic-go to actually send the headers.  For some reason,
+			// WriteHeader doesn't actually write the header.  This isn't needed
+			// for UDP because HTTPStream() calls Flush().
+			if err := f.FlushError(); err != nil {
+				return err
+			}
+		} else {
+			log.Printf("Warning: unable to flush headers")
+		}
+
+		forwardTCP(w, r.Body, conn)
+	}
+
+	s.mx.Lock()
+	delete(s.closers, closer)
+	s.mx.Unlock()
+	return nil
 }
 
 /*
@@ -480,6 +598,128 @@ func udpToCapsules(w io.Writer, conn io.Reader) error {
 		}
 		if err := http3.WriteCapsule(qw, datagramCapsuleType, b[:n]); err != nil {
 			return err
+		}
+	}
+}
+
+type TCPReader interface {
+	io.Reader
+	CloseRead() error
+}
+
+type TCPWriter interface {
+	io.Writer
+	CloseWrite() error
+}
+
+type TCPStream interface {
+	TCPReader
+	TCPWriter
+}
+
+// Lingerer represents [net.TCPConn.SetLinger]
+type Lingerer interface {
+	SetLinger(int) error
+}
+
+func forwardTCP(w io.Writer, r io.Reader, conn TCPStream) {
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		if err := tcpToCapsules(conn, w); err != nil {
+			log.Printf("copying to HTTP stream failed: %v", err)
+			if streamer, isH3 := w.(http3.HTTPStreamer); isH3 {
+				// https://www.ietf.org/archive/id/draft-ietf-httpbis-connect-tcp-09.html#section-3.4-3.3.2.2.2.1.1
+				streamer.HTTPStream().CancelWrite(H3_CONNECT_ERROR)
+			} else if tlsConn, isH1TLS := w.(*tls.Conn); isH1TLS {
+				// Close the TCP socket without sending TLS Finished.
+				// See https://github.com/httpwg/http-extensions/pull/3141
+				tlsConn.NetConn().Close()
+			} else if tcpConn, isPlainH1 := w.(Lingerer); isPlainH1 {
+				// Force RST instead of FIN to propagate error.
+				// https://www.ietf.org/archive/id/draft-ietf-httpbis-connect-tcp-09.html#section-3.4-3.3.2.2.2.4.1
+				tcpConn.SetLinger(0)
+			}
+		}
+		conn.CloseRead()
+	}()
+
+	sendRST := func() {
+		if tcpConn, isTCP := conn.(Lingerer); isTCP {
+			// Force RST instead of FIN to propagate error.
+			// https://www.ietf.org/archive/id/draft-ietf-httpbis-connect-tcp-09.html#section-3.4-3.4.1
+			tcpConn.SetLinger(0)
+		}
+	}
+
+	if err := capsulesToTCP(conn, r); err != nil {
+		log.Printf("copying from HTTP stream failed: %v", err)
+		sendRST()
+	}
+	conn.CloseWrite()
+	// Discard any subsequent capsules.  These must be other capsule types,
+	// since further DATA and FINAL_DATA capsules are prohibited
+	// (https://www.ietf.org/archive/id/draft-ietf-httpbis-connect-tcp-09.html#section-3-2).
+	// All other types are unrecognized, and must be "silently dropped"
+	// (https://datatracker.ietf.org/doc/html/rfc9297#section-3.2-7).
+	go func() {
+		if _, err := io.Copy(io.Discard, r); err != nil {
+			// This is the "RST after FIN" case: inbound data is
+			// complete but outbound data may have been lost.
+			sendRST()
+		}
+	}()
+	// Wait for the TCP sender to close the inbound stream.
+	wg.Wait()
+}
+
+func capsulesToTCP(conn io.Writer, body io.Reader) error {
+	qr := quicvarint.NewReader(body)
+	for {
+		capsuleType, content, err := http3.ParseCapsule(qr)
+		if err != nil {
+			if errors.Is(err, io.EOF) { // Assume content == nil
+				return io.ErrUnexpectedEOF
+			}
+			return err
+		}
+		if capsuleType != data08CapsuleType && capsuleType != finalData08CapsuleType {
+			log.Printf("skipping unknown capsule type %d", capsuleType)
+			continue
+		}
+		if _, err := io.Copy(conn, content); err != nil {
+			return err
+		}
+
+		if capsuleType == finalData08CapsuleType {
+			return nil
+		}
+	}
+}
+
+func tcpToCapsules(conn io.Reader, w io.Writer) error {
+	qw := quicvarint.NewWriter(w)
+	b := make([]byte, maxTCPChunkSize)
+	for {
+		final := false
+		n, err := conn.Read(b)
+		if errors.Is(err, io.EOF) {
+			final = true
+		} else if err != nil {
+			return err
+		}
+
+		capsuleType := data08CapsuleType
+		if final {
+			capsuleType = finalData08CapsuleType
+		}
+
+		if err := http3.WriteCapsule(qw, http3.CapsuleType(capsuleType), b[:n]); err != nil {
+			return err
+		}
+		if final {
+			return nil
 		}
 	}
 }

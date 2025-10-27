@@ -2,6 +2,7 @@ package masque
 
 import (
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -13,7 +14,8 @@ import (
 	"github.com/yosida95/uritemplate/v3"
 )
 
-const requestProtocol = "connect-udp"
+const ConnectUDP = "connect-udp"
+const ConnectTCP = "connect-tcp-08"
 
 var capsuleProtocolHeaderValue string
 
@@ -25,12 +27,14 @@ func init() {
 	capsuleProtocolHeaderValue = v
 }
 
-// Request is the parsed CONNECT-UDP request returned from ParseRequest.
+// Request is the parsed CONNECT-UDP/TCP request returned from ParseRequest.
 // Target is the target server that the client requests to connect to.
 // It can either be DNS name:port or an IP:port.
 type Request struct {
-	Target string
-	Host   string
+	Protocol string // "connect-udp" or "connect-tcp-08"
+	Host     string
+	Target   string
+	Body     io.ReadCloser
 }
 
 // RequestParseError is returned from ParseRequest if parsing the CONNECT-UDP request fails.
@@ -98,7 +102,7 @@ func ParseRequest(r *http.Request, template *uritemplate.Template) (*Request, er
 			Err:        fmt.Errorf("unexpected HTTP version: %d", r.ProtoMajor),
 		}
 	}
-	if protocol != requestProtocol {
+	if protocol != ConnectUDP && protocol != ConnectTCP {
 		return nil, &RequestParseError{
 			HTTPStatus: http.StatusNotImplemented,
 			Err:        fmt.Errorf("unexpected protocol: %s", protocol),
@@ -156,8 +160,10 @@ func ParseRequest(r *http.Request, template *uritemplate.Template) (*Request, er
 		}
 	}
 	return &Request{
-		Target: fmt.Sprintf("%s:%d", targetHost, targetPort),
-		Host:   r.Host,
+		Protocol: protocol,
+		Host:     r.Host,
+		Target:   fmt.Sprintf("%s:%d", targetHost, targetPort),
+		Body:     r.Body,
 	}, nil
 }
 

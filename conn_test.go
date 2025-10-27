@@ -9,6 +9,7 @@ import (
 
 	"github.com/quic-go/masque-go"
 	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/quicvarint"
 	"github.com/stretchr/testify/require"
 )
 
@@ -372,4 +373,186 @@ func setupTandemUDPCapsules() (net.PacketConn, net.PacketConn) {
 	conn2 := masque.ProxiedPacketConn(nil, rspWriter, reqReader, nil, nil)
 
 	return conn1, conn2
+}
+
+func TestTCPCapsules(t *testing.T) {
+	rspReader, rspWriter := io.Pipe()
+	reqReader, reqWriter := io.Pipe()
+
+	conn := masque.ProxiedTCPConn(reqWriter, rspReader, nil, nil)
+
+	go func() {
+		_, err := conn.Write([]byte("upstream"))
+		require.NoError(t, err)
+		err = conn.CloseWrite()
+		require.NoError(t, err)
+	}()
+
+	go func() {
+		downstream := []byte{
+			// FINAL_DATA capsule type varint
+			0xa0, 0x28, 0xd7, 0xf1,
+			// Payload length varint (10)
+			10,
+			// Payload ("downstream")
+			'd', 'o', 'w', 'n', 's', 't', 'r', 'e', 'a', 'm',
+		}
+
+		_, err := rspWriter.Write(downstream)
+		require.NoError(t, err)
+		err = rspWriter.Close()
+		require.NoError(t, err)
+	}()
+
+	expectedUpstream := []byte{
+		// DATA capsule type varint
+		0xa0, 0x28, 0xd7, 0xf0,
+		// Payload length varint (8)
+		8,
+		// Payload ("upstream")
+		'u', 'p', 's', 't', 'r', 'e', 'a', 'm',
+		// FINAL_DATA capsule type varint
+		0xa0, 0x28, 0xd7, 0xf1,
+		// Payload length varint (0)
+		0,
+	}
+
+	receivedUpstream := make([]byte, len(expectedUpstream))
+	_, err := io.ReadFull(reqReader, receivedUpstream)
+	require.NoError(t, err)
+	require.Equal(t, expectedUpstream, receivedUpstream)
+
+	receivedDownstream, err := io.ReadAll(conn)
+	require.NoError(t, err)
+	require.Equal(t, []byte("downstream"), receivedDownstream)
+
+	postCloseUpstream, err := io.ReadAll(reqReader)
+	require.Empty(t, postCloseUpstream)
+	require.NoError(t, err)
+}
+
+func TestTCPDataCapsuleWithoutFinal(t *testing.T) {
+	rspReader, rspWriter := io.Pipe()
+	reqReader, reqWriter := io.Pipe()
+
+	conn := masque.ProxiedTCPConn(reqWriter, rspReader, nil, nil)
+
+	go func() {
+		downstream := []byte{
+			// DATA capsule type varint
+			0xa0, 0x28, 0xd7, 0xf0,
+			// Payload length varint (10)
+			10,
+			// Payload ("downstream")
+			'd', 'o', 'w', 'n', 's', 't', 'r', 'e', 'a', 'm',
+		}
+
+		_, err := rspWriter.Write(downstream)
+		require.NoError(t, err)
+		err = rspWriter.Close()
+		require.NoError(t, err)
+	}()
+
+	receivedDownstream := make([]byte, 10)
+	n, err := io.ReadFull(conn, receivedDownstream)
+	require.NoError(t, err)
+	require.Equal(t, 10, n)
+	require.Equal(t, []byte("downstream"), receivedDownstream)
+
+	// Verify that the next read returns an error (connection closed without FINAL_DATA)
+	buf := make([]byte, 1)
+	_, err = conn.Read(buf)
+	require.ErrorContains(t, err, "reset")
+
+	conn.Close()
+	reqReader.Close()
+}
+
+func setupTandemTCP() (masque.TCPConn, masque.TCPConn) {
+	rspReader, rspWriter := io.Pipe()
+	reqReader, reqWriter := io.Pipe()
+
+	conn1 := masque.ProxiedTCPConn(reqWriter, rspReader, nil, nil)
+	conn2 := masque.ProxiedTCPConn(rspWriter, reqReader, nil, nil)
+
+	return conn1, conn2
+}
+
+func tandemTCPTest(t *testing.T, conn1, conn2 masque.TCPConn, chunks [][]byte) {
+	expected := make([]byte, 0)
+	go func() {
+		for _, chunk := range chunks {
+			expected = append(expected, chunk...)
+			_, err := conn1.Write(chunk)
+			require.NoError(t, err)
+		}
+		conn1.CloseWrite()
+	}()
+
+	output, err := io.ReadAll(conn2)
+	require.NoError(t, err)
+	require.Equal(t, expected, output)
+	conn2.Close()
+}
+
+// Connects two proxied TCP connections back-to-back, and confirms that
+// data flows through and is reconstructed correctly.
+func TestTCPConnectionTandem(t *testing.T) {
+	conn1, conn2 := setupTandemTCP()
+	t.Run("forward", func(t *testing.T) { tandemTCPTest(t, conn1, conn2, [][]byte{{1, 2, 3, 4, 5}}) })
+
+	conn1, conn2 = setupTandemTCP()
+	t.Run("reverse", func(t *testing.T) { tandemTCPTest(t, conn2, conn1, [][]byte{{1, 2, 3, 4, 5}}) })
+
+	conn1, conn2 = setupTandemTCP()
+	t.Run("a few tiny writes", func(t *testing.T) { tandemTCPTest(t, conn1, conn2, [][]byte{{1}, {2, 3}, {4, 5}}) })
+
+	const bigN = 100_000 // Bigger than masque.maxTCPChunkSize
+	largePayload := make([]byte, bigN)
+	for i := range largePayload {
+		largePayload[i] = byte(i)
+	}
+
+	conn1, conn2 = setupTandemTCP()
+	t.Run("one large write", func(t *testing.T) { tandemTCPTest(t, conn2, conn1, [][]byte{largePayload}) })
+
+	tinyWrites := make([][]byte, len(largePayload))
+	for i := range tinyWrites {
+		tinyWrites[i] = largePayload[i : i+1]
+	}
+	conn1, conn2 = setupTandemTCP()
+	t.Run("a lot of tiny writes", func(t *testing.T) { tandemTCPTest(t, conn2, conn1, tinyWrites) })
+
+	conn1, conn2 = setupTandemTCP()
+	t.Run("empty write", func(t *testing.T) { tandemTCPTest(t, conn1, conn2, [][]byte{{}}) })
+
+	conn1, conn2 = setupTandemTCP()
+	t.Run("no write", func(t *testing.T) { tandemTCPTest(t, conn1, conn2, nil) })
+}
+
+func FuzzTCPConnectionTandem(f *testing.F) {
+	// Verify that tandem connect-tcp is equivalent to a byte pipe.
+	f.Fuzz(func(t *testing.T, input []byte) {
+		// Convert `input` into a sequence of chunks.
+		// This "decoding" is a surjection onto all possible chunk sequences,
+		// including sequences that may contain empty chunks.
+		var chunks [][]byte
+		for len(input) > 0 {
+			n, L, err := quicvarint.Parse(input)
+			if err != nil {
+				input = input[1:]
+				continue // Peel off one byte and try again
+			}
+			input = input[L:]
+			if n > uint64(len(input)) {
+				n = uint64(len(input))
+			}
+			t.Logf("Chunk %d has size %d", len(chunks), n)
+			chunks = append(chunks, input[:n])
+			input = input[n:]
+		}
+
+		conn1, conn2 := setupTandemTCP()
+		tandemTCPTest(t, conn1, conn2, chunks)
+	})
 }

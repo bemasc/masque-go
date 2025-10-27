@@ -1,10 +1,13 @@
 package masque
 
 import (
+	"errors"
 	"io"
 	"log"
 	"net"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
@@ -92,4 +95,112 @@ func ProxiedPacketConn(str DatagramSendReceiver, req io.WriteCloser, rsp io.Read
 		}
 	}()
 	return packetConnWrapper{Conn: left, localAddr: laddr, remoteAddr: raddr}
+}
+
+// TCPConn extends net.Conn to provide half-close functionality.
+type TCPConn interface {
+	net.Conn
+	TCPStream
+	Lingerer
+}
+
+// tcpConnWrapper is an implementation detail of tcpPipe().
+// It provides a half-closeable synthetic net.Conn
+// by combining two net.Conn's: one for reading and
+// the other for writing.
+type tcpConnWrapper struct {
+	r, w                  net.Conn
+	localAddr, remoteAddr net.Addr
+
+	// For SetLinger implementation
+	other      *tcpConnWrapper
+	lingerZero atomic.Bool
+}
+
+var errSimulatedReset error = errors.New("connection reset by peer (simulated)")
+
+var _ TCPConn = &tcpConnWrapper{}
+
+func (t *tcpConnWrapper) Read(b []byte) (int, error) {
+	n, err := t.r.Read(b)
+	if errors.Is(err, io.EOF) && t.other.lingerZero.Load() {
+		// When the remote peer has linger equal to zero,
+		// FIN is converted to RST.
+		return n, &net.OpError{
+			Op:     "read",
+			Net:    "tcp",
+			Source: t.localAddr,
+			Addr:   t.remoteAddr,
+			Err:    errSimulatedReset,
+		}
+	}
+	return n, err
+}
+
+func (t *tcpConnWrapper) Write(b []byte) (int, error) {
+	return t.w.Write(b)
+}
+
+func (t *tcpConnWrapper) SetReadDeadline(deadline time.Time) error {
+	return t.r.SetReadDeadline(deadline)
+}
+
+func (t *tcpConnWrapper) SetWriteDeadline(deadline time.Time) error {
+	return t.w.SetWriteDeadline(deadline)
+}
+
+func (t *tcpConnWrapper) SetDeadline(deadline time.Time) error {
+	return errors.Join(
+		t.SetReadDeadline(deadline),
+		t.SetWriteDeadline(deadline))
+}
+
+func (t *tcpConnWrapper) Close() error {
+	return errors.Join(t.CloseWrite(), t.CloseRead())
+}
+
+func (t *tcpConnWrapper) LocalAddr() net.Addr {
+	return t.localAddr
+}
+
+func (t *tcpConnWrapper) RemoteAddr() net.Addr {
+	return t.remoteAddr
+}
+
+func (t *tcpConnWrapper) CloseRead() error {
+	return t.r.Close()
+}
+
+func (t *tcpConnWrapper) CloseWrite() error {
+	return t.w.Close()
+}
+
+func (t *tcpConnWrapper) SetLinger(sec int) error {
+	// Linger zero is the only value that must change the
+	// behavior of the TCPConn, according to the golang docs.
+	t.lingerZero.Store(sec == 0)
+	return nil
+}
+
+// tcpPipe() is equivalent to net.Pipe(), but with support for
+// half-close behaviors.
+func tcpPipe(laddr, raddr net.Addr) (TCPConn, TCPConn) {
+	leftDown, rightDown := net.Pipe()
+	leftUp, rightUp := net.Pipe()
+
+	left := &tcpConnWrapper{r: leftDown, w: leftUp, localAddr: raddr, remoteAddr: laddr}
+	right := &tcpConnWrapper{r: rightUp, w: rightDown, localAddr: laddr, remoteAddr: raddr}
+	left.other, right.other = right, left
+	return left, right
+}
+
+// ProxiedTCPConn converts an HTTP request and response stream, speaking
+// connect-tcp, into a synthetic TCPConn.
+func ProxiedTCPConn(reqStream io.WriteCloser, rspStream io.Reader, laddr, raddr net.Addr) TCPConn {
+	left, right := tcpPipe(laddr, raddr)
+	go func() {
+		forwardTCP(reqStream, rspStream, right)
+		reqStream.Close()
+	}()
+	return left
 }
