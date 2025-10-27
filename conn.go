@@ -1,7 +1,6 @@
 package masque
 
 import (
-	"errors"
 	"io"
 	"log"
 	"net"
@@ -9,7 +8,6 @@ import (
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/quic-go/quicvarint"
 )
 
 type masqueAddr struct{ string }
@@ -79,30 +77,19 @@ func (p packetConnWrapper) Write(b []byte) (int, error) {
 // ProxiedPacketConn converts an HTTP request and response stream, speaking
 // connect-udp, into a synthetic [net.PacketConn] of UDP packets.
 //
+// `str` is optional, and indicates datagram support if non-nil.
+//
 // When the PacketConn is closed, the request and response streams will be closed.
-func ProxiedPacketConn(str DatagramSendReceiver, rsp io.ReadCloser, laddr, raddr net.Addr) net.PacketConn {
+func ProxiedPacketConn(str DatagramSendReceiver, req io.WriteCloser, rsp io.ReadCloser, laddr, raddr net.Addr) net.PacketConn {
 	left, right := net.Pipe()
 
 	go func() {
-		forwardUDP(str, rsp, right)
-		str.Close()
-		str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
+		forwardUDP(str, req, rsp, right)
+		req.Close()
+		if str != nil {
+			str.Close()
+			str.CancelRead(quic.StreamErrorCode(http3.ErrCodeNoError))
+		}
 	}()
 	return packetConnWrapper{Conn: left, localAddr: laddr, remoteAddr: raddr}
-}
-
-func skipCapsules(str quicvarint.Reader) error {
-	for {
-		ct, r, err := http3.ParseCapsule(str)
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return nil
-			}
-			return err
-		}
-		log.Printf("skipping capsule of type %d", ct)
-		if _, err := io.Copy(io.Discard, r); err != nil {
-			return err
-		}
-	}
 }

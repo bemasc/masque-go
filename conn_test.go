@@ -12,6 +12,48 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestUDPToCapsule(t *testing.T) {
+	payload := []byte("upstream")
+	expectedHeader := []byte{ /* DATAGRAM capsule type */ 0x00 /* varint length */, 8}
+	expected := append(expectedHeader, payload...)
+	t.Run("simple", func(t *testing.T) { testUDPToCapsule(t, payload, expected) })
+
+	payload = nil
+	expected = []byte{ /* DATAGRAM capsule type */ 0x00 /* varint length */, 0}
+	t.Run("empty payload", func(t *testing.T) { testUDPToCapsule(t, payload, expected) })
+
+	payload = make([]byte, 1500)
+	expected = append([]byte{ /* DATAGRAM capsule type */ 0x00 /* varint length */, 0x45, 0xdc}, payload...)
+	t.Run("max size payload", func(t *testing.T) { testUDPToCapsule(t, payload, expected) })
+
+	payload = make([]byte, 1501)
+	expected = []byte{}
+	t.Run("oversize payload (1501)", func(t *testing.T) { testUDPToCapsule(t, payload, expected) })
+
+	payload = make([]byte, 1502)
+	expected = []byte{}
+	t.Run("oversize payload (1502)", func(t *testing.T) { testUDPToCapsule(t, payload, expected) })
+}
+
+func testUDPToCapsule(t *testing.T, payload, expected []byte) {
+	rspReader, rspWriter := io.Pipe()
+	reqReader, reqWriter := io.Pipe()
+
+	conn := masque.ProxiedPacketConn(nil, reqWriter, rspReader, nil, nil)
+
+	go func() {
+		addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5678}
+		_, err := conn.WriteTo(payload, addr)
+		require.NoError(t, err)
+		require.NoError(t, conn.Close())
+		require.NoError(t, rspWriter.Close())
+	}()
+
+	received, err := io.ReadAll(reqReader)
+	require.NoError(t, err)
+	require.Equal(t, expected, received)
+}
+
 func TestUDPToDatagram(t *testing.T) {
 	header := [1]byte{0x00} // UDP Context ID
 
@@ -34,9 +76,9 @@ func testUDPToDatagram(t *testing.T, payload, expected []byte) {
 		datagramsSent: make(chan []byte),
 	}
 
-	unusedReader, _ := io.Pipe()
+	unusedReader, unusedWriter := io.Pipe()
 
-	conn := masque.ProxiedPacketConn(fakeStream, unusedReader, nil, nil)
+	conn := masque.ProxiedPacketConn(fakeStream, unusedWriter, unusedReader, nil, nil)
 	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5678}
 
 	// Write upstream data
@@ -79,6 +121,81 @@ func (f *fakeH3Stream) Close() error {
 
 func (f *fakeH3Stream) CancelRead(code quic.StreamErrorCode) {}
 
+func TestCapsulesToUDP(t *testing.T) {
+	stream := []byte{
+		// DATAGRAM capsule type varint (0x00)
+		0x00,
+		// Payload length varint (8)
+		10,
+		// Payload ("upstream")
+		'd', 'o', 'w', 'n', 's', 't', 'r', 'e', 'a', 'm',
+	}
+	expected := [][]byte{[]byte("downstream")}
+	t.Run("simple", func(t *testing.T) { testCapsulesToUDP(t, stream, expected) })
+
+	stream = []byte{0x00, 0}
+	expected = [][]byte{{}}
+	t.Run("empty payload", func(t *testing.T) { testCapsulesToUDP(t, stream, expected) })
+
+	stream = []byte{0x00, 0, 0x00, 0, 0x00, 0}
+	expected = [][]byte{{}, {}, {}}
+	t.Run("empty payload x3", func(t *testing.T) { testCapsulesToUDP(t, stream, expected) })
+
+	stream = []byte{0x00, 1, 1, 0x00, 1, 2, 0x00, 1, 3}
+	expected = [][]byte{{1}, {2}, {3}}
+	t.Run("received in order", func(t *testing.T) { testCapsulesToUDP(t, stream, expected) })
+
+	stream = append([]byte{0x00, 0x45, 0xdc}, make([]byte, 1500)...)
+	expected = [][]byte{make([]byte, 1500)}
+	t.Run("max payload", func(t *testing.T) { testCapsulesToUDP(t, stream, expected) })
+
+	stream = append([]byte{0x00, 0x45, 0xdd}, make([]byte, 1501)...)
+	expected = [][]byte{} // Dropped
+	t.Run("oversize payload (1501)", func(t *testing.T) { testCapsulesToUDP(t, stream, expected) })
+
+	stream = append([]byte{0x00, 0x45, 0xdd}, make([]byte, 1502)...)
+	expected = [][]byte{} // Dropped
+	t.Run("oversize payload (1502)", func(t *testing.T) { testCapsulesToUDP(t, stream, expected) })
+
+	stream = []byte{
+		// DATAGRAM capsule type varint (0x00)
+		0x00,
+		// Payload length varint (2^62-1)
+		0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+		// 7 bytes of actual payload
+		'p', 'a', 'y', 'l', 'o', 'a', 'd'}
+	expected = [][]byte{}
+	// Test that we aren't pre-allocating a buffer of size 2^62-1.
+	t.Run("max-size payload (truncated)", func(t *testing.T) { testCapsulesToUDP(t, stream, expected) })
+}
+
+func testCapsulesToUDP(t *testing.T, stream []byte, expected [][]byte) {
+	rspReader, rspWriter := io.Pipe()
+	_, reqWriter := io.Pipe()
+
+	conn := masque.ProxiedPacketConn(nil, reqWriter, rspReader, nil, nil)
+
+	go func() {
+		_, err := rspWriter.Write(stream)
+		require.NoError(t, err)
+		require.NoError(t, rspWriter.Close())
+	}()
+
+	for _, payload := range expected {
+		buf := make([]byte, len(payload)+1)
+		n, _, err := conn.ReadFrom(buf)
+		require.NoError(t, err)
+		require.Equal(t, payload, buf[:n])
+	}
+
+	n, _, err := conn.ReadFrom(make([]byte, 1))
+	require.Equal(t, io.EOF, err)
+	require.Equal(t, 0, n)
+
+	err = conn.Close()
+	require.NoError(t, err)
+}
+
 func TestDatagramToUDP(t *testing.T) {
 	datagram := []byte{
 		// DATAGRAM context ID varint (0x00)
@@ -105,8 +222,8 @@ func testDatagramToUDP(t *testing.T, datagram, expected []byte) {
 		datagramsToReceive: [][]byte{datagram},
 	}
 
-	unusedReader, _ := io.Pipe()
-	conn := masque.ProxiedPacketConn(fakeStream, unusedReader, nil, nil)
+	unusedReader, unusedWriter := io.Pipe()
+	conn := masque.ProxiedPacketConn(fakeStream, unusedWriter, unusedReader, nil, nil)
 
 	// Check that the datagram was converted to UDP correctly
 	buf := make([]byte, 10*1024)
@@ -127,8 +244,8 @@ func TestOversizeDatagramIsDropped(t *testing.T) {
 		datagramsToReceive: [][]byte{oversizeDatagram},
 	}
 
-	unusedReader, _ := io.Pipe()
-	conn := masque.ProxiedPacketConn(fakeStream, unusedReader, nil, nil)
+	unusedReader, unusedWriter := io.Pipe()
+	conn := masque.ProxiedPacketConn(fakeStream, unusedWriter, unusedReader, nil, nil)
 
 	conn.SetReadDeadline(time.Now().Add(10 * time.Millisecond))
 
@@ -141,7 +258,7 @@ func TestOversizeDatagramIsDropped(t *testing.T) {
 	require.NoError(t, conn.Close())
 }
 
-func TestOversizePacketIsDropped(t *testing.T) {
+func TestOversizePacketIsDroppedInDatagramMode(t *testing.T) {
 	payload := make([]byte, 1501)
 
 	// Create a fake httpStreamer implementation
@@ -149,8 +266,8 @@ func TestOversizePacketIsDropped(t *testing.T) {
 		datagramsSent: make(chan []byte),
 	}
 
-	unusedReader, _ := io.Pipe()
-	conn := masque.ProxiedPacketConn(fakeStream, unusedReader, nil, nil)
+	unusedReader, unusedWriter := io.Pipe()
+	conn := masque.ProxiedPacketConn(fakeStream, unusedWriter, unusedReader, nil, nil)
 	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5678}
 
 	go func() {
@@ -185,7 +302,7 @@ func TestShortReadBuffers(t *testing.T) {
 	}
 
 	unusedReader, unusedWriter := io.Pipe()
-	conn := masque.ProxiedPacketConn(fakeStream, unusedReader, nil, nil)
+	conn := masque.ProxiedPacketConn(fakeStream, unusedWriter, unusedReader, nil, nil)
 
 	// Try a read using a short buffer of exactly the right length.
 	// Applications that use fixed-size UDP packets might do this.
@@ -217,4 +334,42 @@ func TestShortReadBuffers(t *testing.T) {
 	err = conn.Close()
 	require.NoError(t, err)
 
+}
+
+// Connects two proxied UDP connections back-to-back using capsules,
+// and confirms that packets flow through and are reconstructed correctly.
+func TestUDPConnectionTandem(t *testing.T) {
+	conn1, conn2 := setupTandemUDPCapsules()
+	t.Run("forward", func(t *testing.T) { testTandemPacketConns(t, conn1, conn2) })
+	conn1, conn2 = setupTandemUDPCapsules()
+	t.Run("reverse", func(t *testing.T) { testTandemPacketConns(t, conn2, conn1) })
+}
+
+func testTandemPacketConns(t *testing.T, conn1, conn2 net.PacketConn) {
+	input := []byte{1, 2, 3, 4, 5}
+
+	go func() {
+		addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 5678}
+		_, err := conn1.WriteTo(input, addr)
+		require.NoError(t, err)
+	}()
+
+	buf := make([]byte, 1024)
+	n, _, err := conn2.ReadFrom(buf)
+	require.NoError(t, err)
+	output := buf[:n]
+	require.Equal(t, input, output)
+
+	conn1.Close()
+	conn2.Close()
+}
+
+func setupTandemUDPCapsules() (net.PacketConn, net.PacketConn) {
+	rspReader, rspWriter := io.Pipe()
+	reqReader, reqWriter := io.Pipe()
+
+	conn1 := masque.ProxiedPacketConn(nil, reqWriter, rspReader, nil, nil)
+	conn2 := masque.ProxiedPacketConn(nil, rspWriter, reqReader, nil, nil)
+
+	return conn1, conn2
 }

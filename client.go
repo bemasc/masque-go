@@ -82,10 +82,6 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 				InitialPacketSize: defaultInitialPacketSize,
 			}
 		}
-		if !quicConf.EnableDatagrams {
-			c.dialErr = errors.New("masque: QUICConfig needs to enable Datagrams")
-			return
-		}
 		tlsConf := c.TLSClientConfig
 		if tlsConf == nil {
 			tlsConf = &tls.Config{NextProtos: []string{http3.NextProtoH3}}
@@ -96,7 +92,7 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 			return
 		}
 		c.conn = conn
-		tr := &http3.Transport{EnableDatagrams: true}
+		tr := &http3.Transport{EnableDatagrams: quicConf.EnableDatagrams}
 		c.clientConn = tr.NewClientConn(conn)
 	})
 	if c.dialErr != nil {
@@ -114,7 +110,7 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 		return nil, nil, errors.New("masque: server didn't enable Extended CONNECT")
 	}
 	if !settings.EnableDatagrams {
-		return nil, nil, errors.New("masque: server didn't enable Datagrams")
+		log.Printf("masque: server didn't enable Datagrams")
 	}
 
 	rstr, err := c.clientConn.OpenRequestStream(ctx)
@@ -145,7 +141,12 @@ func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Ad
 		}
 	}
 	laddr := masqueAddr{c.conn.LocalAddr().String()}
-	return ProxiedPacketConn(rstr, rsp.Body, laddr, raddr), rsp, nil
+
+	var dgs DatagramSendReceiver
+	if settings.EnableDatagrams && c.QUICConfig.EnableDatagrams {
+		dgs = rstr // Both sides have opted in to datagrams
+	}
+	return ProxiedPacketConn(dgs, rstr, rsp.Body, laddr, raddr), rsp, nil
 }
 
 // Extract the Proxy-Status next-hop value as a UDPAddr.

@@ -19,6 +19,12 @@ import (
 	"go.uber.org/goleak"
 )
 
+var tlsConfig = &tls.Config{
+	ClientCAs:          certPool,
+	NextProtos:         []string{http3.NextProtoH3},
+	InsecureSkipVerify: true,
+}
+
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m)
 }
@@ -65,7 +71,7 @@ func testProxyToIP(t *testing.T, addr *net.UDPAddr) {
 		Handler:         mux,
 	}
 	defer server.Close()
-	proxy := masque.Proxy{}
+	proxy := masque.Proxy{EnableDatagrams: true}
 	defer proxy.Close()
 	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
 		req, err := masque.ParseRequest(r, template)
@@ -83,7 +89,8 @@ func testProxyToIP(t *testing.T, addr *net.UDPAddr) {
 	}()
 
 	cl := masque.Client{
-		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
+		TLSClientConfig: tlsConfig,
+		QUICConfig:      &quic.Config{EnableDatagrams: true},
 	}
 	defer cl.Close()
 	proxiedConn, _, err := cl.Dial(
@@ -108,6 +115,13 @@ func testProxyToIP(t *testing.T, addr *net.UDPAddr) {
 }
 
 func TestProxyToHostname(t *testing.T) {
+	t.Run("datagrams enabled", func(t *testing.T) { testProxyToHostname(t, true, true) })
+	t.Run("datagrams disabled", func(t *testing.T) { testProxyToHostname(t, false, false) })
+	t.Run("no client datagrams", func(t *testing.T) { testProxyToHostname(t, false, true) })
+	t.Run("no server datagrams", func(t *testing.T) { testProxyToHostname(t, true, false) })
+}
+
+func testProxyToHostname(t *testing.T, clientDatagrams, serverDatagrams bool) {
 	remoteServerConn := runEchoServer(t, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
 	defer remoteServerConn.Close()
 
@@ -120,12 +134,12 @@ func TestProxyToHostname(t *testing.T) {
 	mux := http.NewServeMux()
 	server := http3.Server{
 		TLSConfig:       tlsConf,
-		QUICConfig:      &quic.Config{EnableDatagrams: true},
-		EnableDatagrams: true,
+		QUICConfig:      &quic.Config{EnableDatagrams: serverDatagrams},
+		EnableDatagrams: serverDatagrams,
 		Handler:         mux,
 	}
 	defer server.Close()
-	proxy := masque.Proxy{}
+	proxy := masque.Proxy{EnableDatagrams: serverDatagrams}
 	defer proxy.Close()
 	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
 		req, err := masque.ParseRequest(r, template)
@@ -152,7 +166,8 @@ func TestProxyToHostname(t *testing.T) {
 	}()
 
 	cl := masque.Client{
-		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
+		TLSClientConfig: tlsConfig,
+		QUICConfig:      &quic.Config{EnableDatagrams: clientDatagrams},
 	}
 	defer cl.Close()
 	proxiedConn, rsp, err := cl.DialAddr(context.Background(), template, "quic-go.net:1234") // the proxy doesn't actually resolve this hostname
@@ -187,7 +202,7 @@ func TestProxyingRejected(t *testing.T) {
 		Handler:         mux,
 	}
 	defer server.Close()
-	proxy := masque.Proxy{}
+	proxy := masque.Proxy{EnableDatagrams: true}
 	defer proxy.Close()
 	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusTeapot) })
 	go func() {
@@ -197,7 +212,8 @@ func TestProxyingRejected(t *testing.T) {
 	}()
 
 	cl := masque.Client{
-		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
+		TLSClientConfig: tlsConfig,
+		QUICConfig:      &quic.Config{EnableDatagrams: true},
 	}
 	defer cl.Close()
 	_, rsp, err := cl.DialAddr(context.Background(), template, "quic-go.net:1234") // the proxy doesn't actually resolve this hostname
@@ -207,7 +223,8 @@ func TestProxyingRejected(t *testing.T) {
 
 func TestProxyToHostnameMissingPort(t *testing.T) {
 	cl := masque.Client{
-		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
+		TLSClientConfig: tlsConfig,
+		QUICConfig:      &quic.Config{EnableDatagrams: true},
 	}
 	defer cl.Close()
 	_, rsp, err := cl.DialAddr(
@@ -237,7 +254,7 @@ func TestProxyShutdown(t *testing.T) {
 		Handler:         mux,
 	}
 	defer server.Close()
-	proxy := masque.Proxy{}
+	proxy := masque.Proxy{EnableDatagrams: true}
 	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
 		req, err := masque.ParseRequest(r, template)
 		if err != nil {
@@ -254,7 +271,8 @@ func TestProxyShutdown(t *testing.T) {
 	}()
 
 	cl := masque.Client{
-		TLSClientConfig: &tls.Config{ClientCAs: certPool, NextProtos: []string{http3.NextProtoH3}, InsecureSkipVerify: true},
+		TLSClientConfig: tlsConfig,
+		QUICConfig:      &quic.Config{EnableDatagrams: true},
 	}
 	defer cl.Close()
 	proxiedConn, rsp, err := cl.Dial(context.Background(), template, remoteServerConn.LocalAddr().(*net.UDPAddr))
