@@ -89,8 +89,10 @@ func testProxyToIP(t *testing.T, addr *net.UDPAddr) {
 	}()
 
 	cl := masque.Client{
-		TLSClientConfig: tlsConfig,
-		QUICConfig:      &quic.Config{EnableDatagrams: true},
+		Connector: &masque.H3Client{
+			TLSClientConfig: tlsConfig,
+			QUICConfig:      &quic.Config{EnableDatagrams: true},
+		},
 	}
 	defer cl.Close()
 	proxiedConn, _, err := cl.Dial(
@@ -166,8 +168,10 @@ func testProxyToHostname(t *testing.T, clientDatagrams, serverDatagrams bool) {
 	}()
 
 	cl := masque.Client{
-		TLSClientConfig: tlsConfig,
-		QUICConfig:      &quic.Config{EnableDatagrams: clientDatagrams},
+		Connector: &masque.H3Client{
+			TLSClientConfig: tlsConfig,
+			QUICConfig:      &quic.Config{EnableDatagrams: clientDatagrams},
+		},
 	}
 	defer cl.Close()
 	proxiedConn, rsp, err := cl.DialAddr(context.Background(), template, "quic-go.net:1234") // the proxy doesn't actually resolve this hostname
@@ -212,8 +216,10 @@ func TestProxyingRejected(t *testing.T) {
 	}()
 
 	cl := masque.Client{
-		TLSClientConfig: tlsConfig,
-		QUICConfig:      &quic.Config{EnableDatagrams: true},
+		Connector: &masque.H3Client{
+			TLSClientConfig: tlsConfig,
+			QUICConfig:      &quic.Config{EnableDatagrams: true},
+		},
 	}
 	defer cl.Close()
 	_, rsp, err := cl.DialAddr(context.Background(), template, "quic-go.net:1234") // the proxy doesn't actually resolve this hostname
@@ -223,8 +229,10 @@ func TestProxyingRejected(t *testing.T) {
 
 func TestProxyToHostnameMissingPort(t *testing.T) {
 	cl := masque.Client{
-		TLSClientConfig: tlsConfig,
-		QUICConfig:      &quic.Config{EnableDatagrams: true},
+		Connector: &masque.H3Client{
+			TLSClientConfig: tlsConfig,
+			QUICConfig:      &quic.Config{EnableDatagrams: true},
+		},
 	}
 	defer cl.Close()
 	_, rsp, err := cl.DialAddr(
@@ -271,8 +279,10 @@ func TestProxyShutdown(t *testing.T) {
 	}()
 
 	cl := masque.Client{
-		TLSClientConfig: tlsConfig,
-		QUICConfig:      &quic.Config{EnableDatagrams: true},
+		Connector: &masque.H3Client{
+			TLSClientConfig: tlsConfig,
+			QUICConfig:      &quic.Config{EnableDatagrams: true},
+		},
 	}
 	defer cl.Close()
 	proxiedConn, rsp, err := cl.Dial(context.Background(), template, remoteServerConn.LocalAddr().(*net.UDPAddr))
@@ -299,4 +309,66 @@ func TestProxyShutdown(t *testing.T) {
 		time.Sleep(100 * time.Millisecond)
 	}
 	require.True(t, errored, "expected datagram write side to error")
+}
+
+func TestH1(t *testing.T) {
+	addr := &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0}
+	remoteServerConn := runEchoServer(t, addr)
+	defer remoteServerConn.Close()
+
+	listener, err := net.ListenTCP("tcp", &net.TCPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 0})
+	require.NoError(t, err)
+	defer listener.Close()
+	t.Logf("server listening on %s", listener.Addr())
+	template := uritemplate.MustNew(fmt.Sprintf("http://localhost:%d/masque?h={target_host}&p={target_port}", listener.Addr().(*net.TCPAddr).Port))
+
+	mux := http.NewServeMux()
+	server := http.Server{
+		Handler: mux,
+	}
+	defer server.Close()
+	proxy := masque.Proxy{EnableDatagrams: true}
+	defer proxy.Close()
+	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
+		req, err := masque.ParseRequest(r, template)
+		if err != nil {
+			t.Log("Upgrade failed:", err)
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+
+		err = proxy.Proxy(w, req)
+		if err != nil {
+			t.Error(err)
+		}
+	})
+	go func() {
+		if err := server.Serve(listener); err != nil {
+			return
+		}
+	}()
+
+	cl := masque.Client{
+		Connector: &masque.H1Client{},
+	}
+	defer cl.Close()
+	proxiedConn, _, err := cl.Dial(
+		context.Background(),
+		template,
+		remoteServerConn.LocalAddr().(*net.UDPAddr),
+	)
+	require.NoError(t, err)
+
+	_, err = proxiedConn.WriteTo([]byte("foobar"), remoteServerConn.LocalAddr())
+	require.NoError(t, err)
+	b := make([]byte, 1500)
+	n, raddr, err := proxiedConn.ReadFrom(b)
+	require.NoError(t, err)
+	require.Equal(t, []byte("foobar"), b[:n])
+
+	// Check raddr
+	expected := remoteServerConn.LocalAddr().(*net.UDPAddr)
+	observed := raddr.(*net.UDPAddr)
+	require.True(t, observed.IP.Equal(expected.IP))
+	require.Equal(t, expected.Port, observed.Port)
 }

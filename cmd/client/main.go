@@ -23,23 +23,48 @@ import (
 func main() {
 	var proxyURITemplate string
 	flag.StringVar(&proxyURITemplate, "t", "", "URI template.")
+	var useQuic bool
+	flag.BoolVar(&useQuic, "quic", true, "Use QUIC to reach the proxy.")
 	var useDatagrams bool
 	flag.BoolVar(&useDatagrams, "datagrams", true, "Use QUIC datagrams to reach the proxy.")
+	var insecureTLS bool
+	flag.BoolVar(&insecureTLS, "insecure-tls", false, "Ignore TLS certificate errors from the proxy.")
 	flag.Parse()
 	if proxyURITemplate == "" {
 		flag.Usage()
 		os.Exit(1)
 	}
-	urls := flag.Args()
-	if len(urls) != 1 {
-		log.Fatal("usage: client -t <template> <url>")
+
+	parsedTemplate, err := uritemplate.New(proxyURITemplate)
+	if err != nil {
+		log.Fatalf("failed to parse template: %v", err)
 	}
 
-	cl := masque.Client{
-		QUICConfig: &quic.Config{
-			EnableDatagrams:   useDatagrams,
-			InitialPacketSize: 1350,
-		},
+	urls := flag.Args()
+	if len(urls) != 1 {
+		log.Fatalf("Must specify exactly one destination URL (not %d)", len(urls))
+	}
+
+	cl := masque.Client{}
+	if useQuic {
+		cl.Connector = &masque.H3Client{
+			QUICConfig: &quic.Config{
+				EnableDatagrams:   useDatagrams,
+				InitialPacketSize: 1350,
+			},
+			TLSClientConfig: &tls.Config{
+				NextProtos:         []string{http3.NextProtoH3},
+				InsecureSkipVerify: insecureTLS,
+			},
+		}
+	} else {
+		// TODO: H2 Support (blocked on https://github.com/golang/go/issues/53208)
+		cl.Connector = &masque.H1Client{
+			TLSClientConfig: &tls.Config{
+				NextProtos:         []string{"http/1.1"},
+				InsecureSkipVerify: insecureTLS,
+			},
+		}
 	}
 	host, port, err := extractHostAndPort(urls[0])
 	if err != nil {
@@ -53,7 +78,7 @@ func main() {
 				if err != nil {
 					return nil, err
 				}
-				pconn, _, err := cl.Dial(context.Background(), uritemplate.MustNew(proxyURITemplate), raddr)
+				pconn, _, err := cl.Dial(ctx, parsedTemplate, raddr)
 				if err != nil {
 					log.Fatal("dialing MASQUE failed:", err)
 				}

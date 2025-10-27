@@ -1,12 +1,15 @@
 package masque
 
 import (
+	"bufio"
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	"sync"
 
 	"github.com/dunglas/httpsfv"
@@ -170,11 +173,60 @@ func (s *Proxy) Proxy(w http.ResponseWriter, r *Request) error {
 	return s.ProxyConnectedSocket(w, r, conn)
 }
 
+func hijackIfH1(w http.ResponseWriter) (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, isH1 := w.(http.Hijacker)
+	if !isH1 {
+		return nil, nil, nil
+	}
+	return hijacker.Hijack()
+}
+
+func writeResponseWithHijacker(headers http.Header, httpConn net.Conn, buf *bufio.ReadWriter, protocol string) error {
+	statusCode := http.StatusSwitchingProtocols
+	if buf.Reader.Buffered() > 0 {
+		statusCode = http.StatusBadRequest
+		if proxyStatusVals := headers.Values("Proxy-Status"); len(proxyStatusVals) > 0 {
+			proxyStatus, err := httpsfv.UnmarshalItem(proxyStatusVals)
+			if err != nil {
+				return fmt.Errorf("encountered invalid Proxy-Status: %w", err)
+			}
+			proxyStatus.Params.Add("error", "proxy_internal_response")
+			proxyStatus.Params.Add("detail",
+				fmt.Sprintf("client sent %d bytes of optimistic data, not allowed in HTTP/1.1", buf.Available()))
+			newProxyStatusVal, err := httpsfv.Marshal(proxyStatus)
+			if err != nil {
+				return fmt.Errorf("Couldn't serialize Proxy-Status: %w", err)
+			}
+			headers.Set("Proxy-Status", newProxyStatusVal)
+		}
+	}
+
+	rsp := http.Response{
+		StatusCode:    statusCode,
+		ProtoMajor:    1,
+		ProtoMinor:    1,
+		ContentLength: -1,
+		Header:        headers,
+	}
+	if statusCode == http.StatusSwitchingProtocols {
+		rsp.Header.Set("Connection", "Upgrade")
+		rsp.Header.Set("Upgrade", protocol)
+	}
+	rspBytes, err := httputil.DumpResponse(&rsp, false)
+	if err != nil {
+		return err
+	}
+	if _, err := httpConn.Write(rspBytes); err != nil {
+		return err
+	}
+	return nil
+}
+
 // ProxyConnectedSocket proxies a request on a connected UDP socket.
 // Applications may add custom header fields such as Proxy-Status
 // to the response header, but MUST NOT call WriteHeader on the
 // http.ResponseWriter. It closes the connection before returning.
-func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, _ *Request, conn *net.UDPConn) error {
+func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, r *Request, conn *net.UDPConn) error {
 	s.mx.Lock()
 	if s.closed {
 		s.mx.Unlock()
@@ -183,30 +235,52 @@ func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, _ *Request, conn *ne
 		return net.ErrClosed
 	}
 
-	str := w.(http3.HTTPStreamer).HTTPStream()
-	entry := proxyEntry{str: str, conn: conn}
-
+	var closer io.Closer
 	if s.closers == nil {
 		s.closers = make(map[io.Closer]struct{})
 	}
-	s.closers[entry] = struct{}{}
 
 	s.refCount.Add(1)
 	defer s.refCount.Done()
-	s.mx.Unlock()
 
 	w.Header().Set(http3.CapsuleProtocolHeader, capsuleProtocolHeaderValue)
-	w.WriteHeader(http.StatusOK)
-
-	var dgs DatagramSendReceiver
-	if s.EnableDatagrams && clientAcceptsDatagrams(w) {
-		dgs = str
+	h1Conn, buf, err := hijackIfH1(w)
+	if err != nil {
+		return err
 	}
-	forwardUDP(dgs, w, str, conn)
-	str.Close()
+	if h1Conn != nil {
+		defer h1Conn.Close()
+
+		// The request body is no longer relevant due to hijack.  Use the
+		// hijacked connection instead.
+		closer = h1Conn
+		s.closers[closer] = struct{}{}
+		s.mx.Unlock()
+
+		if err := writeResponseWithHijacker(w.Header(), h1Conn, buf, requestProtocol); err != nil {
+			return err
+		}
+
+		forwardUDP(nil, h1Conn, h1Conn, conn)
+	} else {
+		w.WriteHeader(http.StatusOK)
+
+		str := w.(http3.HTTPStreamer).HTTPStream()
+
+		closer = proxyEntry{str: str, conn: conn}
+		s.closers[closer] = struct{}{}
+		s.mx.Unlock()
+
+		var dgs DatagramSendReceiver
+		if s.EnableDatagrams && clientAcceptsDatagrams(w) {
+			dgs = str
+		}
+		forwardUDP(dgs, w, str, conn)
+		str.Close()
+	}
 
 	s.mx.Lock()
-	delete(s.closers, entry)
+	delete(s.closers, closer)
 	s.mx.Unlock()
 	return nil
 }

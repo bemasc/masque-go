@@ -1,6 +1,7 @@
 package masque
 
 import (
+	"bufio"
 	"context"
 	"crypto/tls"
 	"errors"
@@ -22,20 +23,17 @@ import (
 // This allows tunneling QUIC connections, which themselves have a minimum MTU requirement of 1200 bytes.
 const defaultInitialPacketSize = 1350
 
-// A Client establishes proxied connections to remote hosts, using a UDP proxy.
-// Multiple flows can be proxied via the same connection to the proxy.
+type Connector interface {
+	// Connect establishes a proxied UDP connection at the specified expanded template.
+	Connect(ctx context.Context, expandedTemplate string, raddr net.Addr) (net.PacketConn, *http.Response, error)
+
+	// Close closes the connection to the proxy.
+	// This immediately shuts down all proxied flows.
+	Close() error
+}
+
 type Client struct {
-	// TLSClientConfig is the TLS client config used when dialing the QUIC connection to the proxy.
-	// It must set the "h3" ALPN.
-	TLSClientConfig *tls.Config
-
-	// QUICConfig is the QUIC config used when dialing the QUIC connection.
-	QUICConfig *quic.Config
-
-	dialOnce   sync.Once
-	dialErr    error
-	conn       *quic.Conn
-	clientConn *http3.ClientConn
+	Connector Connector
 }
 
 // DialAddr dials a proxied connection to a target server.
@@ -53,7 +51,7 @@ func (c *Client) DialAddr(ctx context.Context, proxyTemplate *uritemplate.Templa
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to expand Template: %w", err)
 	}
-	return c.dial(ctx, str, masqueAddr{target})
+	return c.Connector.Connect(ctx, str, masqueAddr{target})
 }
 
 // Dial dials a proxied connection to a target server.
@@ -65,10 +63,31 @@ func (c *Client) Dial(ctx context.Context, proxyTemplate *uritemplate.Template, 
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to expand Template: %w", err)
 	}
-	return c.dial(ctx, str, raddr)
+	return c.Connector.Connect(ctx, str, raddr)
 }
 
-func (c *Client) dial(ctx context.Context, expandedTemplate string, raddr net.Addr) (net.PacketConn, *http.Response, error) {
+func (c *Client) Close() error {
+	return c.Connector.Close()
+}
+
+// H3Client establishes proxied UDP connections to remote hosts, using HTTP/3.
+// Multiple flows can be proxied via the same connection to the proxy, but all
+// requests will be sent to the proxy indicated in the first request.
+type H3Client struct {
+	// TLSClientConfig is the TLS client config used when dialing the QUIC connection to the proxy.
+	// It must set the "h3" ALPN.
+	TLSClientConfig *tls.Config
+
+	// QUICConfig is the QUIC config used when dialing the QUIC connection.
+	QUICConfig *quic.Config
+
+	dialOnce   sync.Once
+	dialErr    error
+	conn       *quic.Conn
+	clientConn *http3.ClientConn
+}
+
+func (c *H3Client) Connect(ctx context.Context, expandedTemplate string, raddr net.Addr) (net.PacketConn, *http.Response, error) {
 	u, err := url.Parse(expandedTemplate)
 	if err != nil {
 		return nil, nil, fmt.Errorf("masque: failed to parse URI: %w", err)
@@ -191,10 +210,86 @@ func nextHopAddr(rsp *http.Response) *net.UDPAddr {
 
 // Close closes the connection to the proxy.
 // This immediately shuts down all proxied flows.
-func (c *Client) Close() error {
+func (c *H3Client) Close() error {
 	c.dialOnce.Do(func() {}) // wait for existing calls to finish
 	if c.conn != nil {
 		return c.conn.CloseWithError(0, "")
 	}
+	return nil
+}
+
+// H1Client establishes proxied UDP connections to remote hosts, using HTTP/1.1.
+type H1Client struct {
+	TLSClientConfig *tls.Config
+}
+
+func (c *H1Client) Connect(ctx context.Context, expandedTemplate string, raddr net.Addr) (net.PacketConn, *http.Response, error) {
+	u, err := url.Parse(expandedTemplate)
+	if err != nil {
+		return nil, nil, fmt.Errorf("masque: failed to parse URI: %w", err)
+	}
+	var httpConn net.Conn
+
+	authority := u.Host
+
+	switch u.Scheme {
+	case "http":
+		if u.Port() == "" {
+			authority = authority + ":80"
+		}
+		dialer := &net.Dialer{}
+		httpConn, err = dialer.DialContext(ctx, "tcp", authority)
+
+	case "https":
+		if u.Port() == "" {
+			authority = authority + ":443"
+		}
+		tlsDialer := &tls.Dialer{
+			Config: c.TLSClientConfig,
+		}
+
+		httpConn, err = tlsDialer.DialContext(ctx, "tcp", authority)
+	default:
+		return nil, nil, fmt.Errorf("unsupported scheme: %s", u.Scheme)
+	}
+
+	if err != nil {
+		return nil, nil, err
+	}
+
+	request := &http.Request{
+		Method: http.MethodGet,
+		URL:    u,
+		Header: http.Header{
+			"Connection":                {"Upgrade"},
+			"Upgrade":                   {requestProtocol},
+			http3.CapsuleProtocolHeader: {capsuleProtocolHeaderValue},
+		},
+	}
+	if err := request.Write(httpConn); err != nil {
+		return nil, nil, err
+	}
+
+	rsp, err := http.ReadResponse(bufio.NewReader(httpConn), request)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	if rsp.StatusCode != http.StatusSwitchingProtocols {
+		return nil, rsp, fmt.Errorf("masque: server responded with %d", rsp.StatusCode)
+	}
+
+	if _, udp := raddr.(*net.UDPAddr); !udp {
+		if udpAddr := nextHopAddr(rsp); udpAddr != nil {
+			raddr = udpAddr
+		}
+	}
+	laddr := masqueAddr{httpConn.LocalAddr().String()}
+	conn := ProxiedPacketConn(nil, httpConn, httpConn, laddr, raddr)
+	return conn, rsp, nil
+}
+
+func (c *H1Client) Close() error {
+	log.Printf("H1Client.Close is a no-op")
 	return nil
 }
