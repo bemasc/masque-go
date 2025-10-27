@@ -20,6 +20,8 @@ const (
 	uriTemplateTargetPort = "target_port"
 )
 
+const datagramCapsuleType = 0x00
+
 const maxUDPPayloadSize = 1500
 
 var contextIDZero = quicvarint.Append([]byte{}, 0)
@@ -63,6 +65,12 @@ func isCleanShutdownError(err error) bool {
 
 // A Proxy is an RFC 9298 CONNECT-UDP proxy.
 type Proxy struct {
+	// EnableDatagrams must match QUICConfig.EnableDatagrams,
+	// Transport.EnableDatagrams, and Settings.EnableDatagrams.
+	// It is required here because there is no way to recover the QUICConfig,
+	// Transport, or local Settings from the request or response.
+	EnableDatagrams bool
+
 	mx       sync.Mutex
 	closed   bool
 	refCount sync.WaitGroup // counter for the Go routines spawned in Upgrade
@@ -190,7 +198,11 @@ func (s *Proxy) ProxyConnectedSocket(w http.ResponseWriter, _ *Request, conn *ne
 	w.Header().Set(http3.CapsuleProtocolHeader, capsuleProtocolHeaderValue)
 	w.WriteHeader(http.StatusOK)
 
-	forwardUDP(str, str, conn)
+	var dgs DatagramSendReceiver
+	if s.EnableDatagrams && clientAcceptsDatagrams(w) {
+		dgs = str
+	}
+	forwardUDP(dgs, w, str, conn)
 	str.Close()
 
 	s.mx.Lock()
@@ -219,6 +231,19 @@ type DatagramSendReceiver interface {
 var _ DatagramSendReceiver = &http3.Stream{}
 var _ DatagramSendReceiver = &http3.RequestStream{}
 
+// Returns true if the client has offered to receive datagrams.
+func clientAcceptsDatagrams(w http.ResponseWriter) bool {
+	hijacker, ok := w.(http3.Hijacker)
+	if !ok {
+		return false
+	}
+
+	h3Connection := hijacker.Connection()
+	<-h3Connection.ReceivedSettings()
+	remoteSettings := h3Connection.Settings()
+	return remoteSettings.EnableDatagrams
+}
+
 /*
  * Forwarding function conventions:
  * `*To*` functions block until that direction of forwarding is complete.
@@ -229,25 +254,37 @@ var _ DatagramSendReceiver = &http3.RequestStream{}
 
 // `r`, `w`, and `conn` are required.
 // `str` indicates Datagram support if non-nil.
-func forwardUDP(str DatagramSendReceiver, r io.ReadCloser, conn net.Conn) {
+func forwardUDP(str DatagramSendReceiver, w io.Writer, r io.ReadCloser, conn net.Conn) {
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		if err := udpToDatagrams(str, conn); err != nil && !isCleanShutdownError(err) {
-			log.Printf("proxying %s to datagrams stopped: %v", conn.RemoteAddr(), err)
-		}
-		r.Close()
-	}()
-	go func() {
-		defer wg.Done()
-		if err := datagramsToUDP(conn, str); err != nil && !isCleanShutdownError(err) {
-			log.Printf("proxying datagrams to %s failed: %v", conn.RemoteAddr(), err)
-		}
-	}()
-	// discard all capsules sent on the request stream
-	if err := skipCapsules(quicvarint.NewReader(r)); err != nil && !isCleanShutdownError(err) {
-		log.Printf("reading from request stream failed: %v", err)
+	if str != nil {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			if err := udpToDatagrams(str, conn); err != nil && !isCleanShutdownError(err) {
+				log.Printf("proxying %s to datagrams stopped: %v", conn.RemoteAddr(), err)
+			}
+			r.Close()
+		}()
+		go func() {
+			defer wg.Done()
+			if err := datagramsToUDP(conn, str); err != nil && !isCleanShutdownError(err) {
+				log.Printf("proxying datagrams to %s failed: %v", conn.RemoteAddr(), err)
+			}
+		}()
+	} else {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := udpToCapsules(w, conn); err != nil && !isCleanShutdownError(err) {
+				log.Printf("writing to HTTP stream failed: %v", err)
+			}
+			r.Close()
+		}()
+	}
+
+	// The remote peer can always choose to send capsules.
+	if err := capsulesToUDP(conn, r); err != nil && !isCleanShutdownError(err) {
+		log.Printf("reading from HTTP stream failed: %#v", err)
 	}
 	conn.Close()
 	wg.Wait()
@@ -296,6 +333,78 @@ func udpToDatagrams(str DatagramSender, conn io.Reader) error {
 			continue
 		}
 		if err := str.SendDatagram(b[:len(contextIDZero)+n]); err != nil {
+			return err
+		}
+	}
+}
+
+func capsulesToUDP(conn io.Writer, body io.Reader) error {
+	qr := quicvarint.NewReader(body)
+	b := make([]byte, maxUDPPayloadSize+1)
+	for {
+		capsuleType, content, err := http3.ParseCapsule(qr)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if capsuleType != datagramCapsuleType {
+			log.Printf("skipping unknown capsule type %d", capsuleType)
+			continue
+		}
+		n, err := readAll(content, b)
+		if n > maxUDPPayloadSize {
+			// Drain remainder of oversize capsule
+			remainder, err := io.Copy(io.Discard, content)
+			if err != nil {
+				return err
+			}
+			log.Printf("skipped datagram capsule larger than MTU (%d > %d)", int64(n)+remainder, maxUDPPayloadSize)
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		if _, err := conn.Write(b[:n]); err != nil {
+			return err
+		}
+	}
+}
+
+// Read all the data from r until EOF.  If this doesn't fit in b,
+// ErrShortBuffer is returned.
+func readAll(r io.Reader, b []byte) (int, error) {
+	blen := 0
+	for blen < len(b) {
+		n, err := r.Read(b[blen:])
+		blen += n
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return blen, nil
+			}
+			return blen, err
+		}
+	}
+	return blen, io.ErrShortBuffer
+}
+
+func udpToCapsules(w io.Writer, conn io.Reader) error {
+	qw := quicvarint.NewWriter(w)
+	b := make([]byte, maxUDPPayloadSize+1)
+	for {
+		n, err := conn.Read(b)
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				return nil
+			}
+			return err
+		}
+		if n > maxUDPPayloadSize {
+			log.Printf("dropping UDP packet larger than MTU")
+			continue
+		}
+		if err := http3.WriteCapsule(qw, datagramCapsuleType, b[:n]); err != nil {
 			return err
 		}
 	}

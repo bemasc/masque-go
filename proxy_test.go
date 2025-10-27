@@ -37,7 +37,7 @@ func TestProxyCloseProxiedConn(t *testing.T) {
 	serverPort := serverConn.LocalAddr().(*net.UDPAddr).Port
 	template := uritemplate.MustNew(fmt.Sprintf("https://localhost:%d/masque?h={target_host}&p={target_port}", serverPort))
 
-	p := masque.Proxy{}
+	p := masque.Proxy{EnableDatagrams: true}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/masque", func(w http.ResponseWriter, r *http.Request) {
 		req, err := masque.ParseRequest(r, template)
